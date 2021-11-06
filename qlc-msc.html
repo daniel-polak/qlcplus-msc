@@ -1,0 +1,197 @@
+<!-- 
+QLC+ MIDI Show Control (MSC) implementation script
+Version: 1-2021
+Made with <3 by Daniel
+-->
+
+<script id="thisscript" type="text/javascript">
+
+    //-------------------------SETUP VARIABLES: ------------------------------------
+
+    const msc_device_id = 1; // the MSC device id (this script responds to 127 regardless)
+    const autoload = true; // false enables MSC when the label is doubleclicked
+    const convert_cue_numbers = true; // if false no cue number conversion takes place
+    
+    //-----------------------end of setup variables --------------------------------
+
+    // some script related global vars
+    const labeldiv = document.getElementById("thisscript").parentElement; // get easy access to the label this script is pasted in
+    let cuelistnumbers = []; // an array to store cuelist ids for later use
+
+    
+    
+    // setup based on if autorun is enabled or not
+    if (autoload == true) window.addEventListener("load", init())
+    else {
+        displayMsg("Please doubleclick this box to enable MSC.");
+        labeldiv.addEventListener("dblclick", init())
+    } 
+    
+    
+    // a function to set everything up
+    function init() {
+        
+        displayMsg("Please give this tab MIDI permissions.");
+        
+        navigator.requestMIDIAccess({sysex:true}).then(function(midi) {
+            // MIDI access was successful
+
+            // assign an event handler function to run when a message is recieved
+            for (var input of midi.inputs.values()) {
+                input.onmidimessage = messageEvent;
+            }
+            
+            let cuelists = document.getElementsByClassName("vccuelist"); // list of cuelist elements
+        
+            for (let cuelist of cuelists) {
+                // cuelist number
+                cuelist.getElementsByTagName("th")[0].innerText = cuelist.id;
+               
+                // add culist nubmers to global a globar variable for later use
+                cuelistnumbers.push(cuelist.id)
+                
+                let cell = 0; // this describes the cell in the table row were the cue number gets taken from
+                if (convert_cue_numbers == true) cell = 1 // use the second cell (i.e. the cue name)
+
+                //cue names to msc number conversion
+                let cues = cuelist.getElementsByTagName("tr");
+                for (cue of cues) {
+                    
+                    // skip table rows with no id
+                    if (cue.id == "") continue;
+                    
+                    let name = cue.getElementsByTagName("td")[cell].innerText;
+                    
+                    // lets derive the cue number using some light sanitization:
+                    let mscCueNum = name.replace(/[^\.\-0-9]/g,"") // remove all chars that aren't dots, dashes or digits 
+                    .replace("-",".") // replace dashes with dots
+                    .replace("_",".") // replace underscores with dots
+                    .replace(/\.{1,}/,".") // replace multiple conecutive periods with a single one
+                    //.replace(/\.(?=[^.]*\.)/, "") // remove all but the last period
+                    .replace(/^\./, "") // remove a period if its at the start of the number
+                    .replace(/\.$/, "") // remove a period if ths at the end of the number
+                    .replace(/0*(?=.*.)/, ""); // remove one or more zeros at the start of the number (but not all zeros)
+                    
+                    if (convert_cue_numbers == true) {
+                        cue.setAttribute("data-msc-cue-number", mscCueNum); // set data attr variable
+                        cue.getElementsByTagName("td")[0].innerText = mscCueNum; //set the first cell to the msc cue number so the user knows what the new names are
+                    }
+                    else {
+                        cue.setAttribute("data-msc-cue-number", name); // set data attr variable
+                    }
+                }
+            }
+            // give the user a heads-up on what happened.
+            if (convert_cue_numbers == true) displayMsg("MIDI access successful!\nCue numbers have been updated.","green");
+            else displayMsg("MIDI access successful! Ready to recieve MSC commands.","green");
+
+        }, function(err_message) {
+            //MIDI access failed
+            displayMsg("Failed to get MIDI access!", "red");
+            console.log("Failed to get MIDI access! Debug: " + err_message);
+        });
+    }
+    
+    // this runs when a midi message is recieved
+    // this function implements midi message filtering and decoding
+    function messageEvent(midiMessage) {
+        // time to parse msc messages
+        let data = midiMessage.data;
+        
+        // stop execution if the first two bytes aren't F0 (sysex) and 7F (msc) 
+        if (data[0] != 240 || data[1] != 127) return;
+        
+        // stop execution if the device id [byte 3] doesn't match the defined value
+        if (data[2] != msc_device_id && data[2] != 127) return;
+        
+        // stop execution if the command format [byte 5] does not match 01 or 7F
+        if (data[4] != 1 && data[4] != 127) return;
+        
+        // stop execution if command is unknown
+        if (data[5] != 1 && data[5] != 10) return;
+        
+        // RESET MSC command (stop all cuelists)
+        if (data[5] == 10) {
+            cuelistnumbers.forEach(function(number) {
+                sendCueCmd(number, "STOP");
+            });
+            displayMsg("Recieved MSC command: \n RESET");
+            return;
+        }
+        
+        // GO MSC command (no other midi messages should get past this point)
+        
+        // chop off the first six bytes to get the msc command data and the termianting byte (7f)
+        let cmddata = data.slice(6),
+        cmddata_string = "";
+        
+        // convert the byte array into a string with cue number, list and path deliniated by a \x00 character
+        cmddata.forEach(function(itm) {
+            if (itm == 247) return;
+            cmddata_string += String.fromCharCode(itm);
+        });
+        
+        // finally we get an array with between 1 and 3 entries
+        let data_array = cmddata_string.split("\x00");
+        
+        // if no cue number is specified (i.e. the first entry in the array is an empty string), advance all cuelists to next cue
+        if (data_array[0] == "") {
+            cuelistnumbers.forEach(function(number) {
+                displayMsg(`Recieved MSC command: \n GO cue [NEXT]`);
+                sendCueCmd(number, "NEXT");
+            });
+            return;
+        }
+        
+        // if no cue list is specified, fire the corresponging cues in all lists (handled by the called function)
+        if (data_array.length == 1) { 
+            fireCueByNumber(data_array[0]);
+            displayMsg(`Recieved MSC command: \n GO cue ${data_array[0]} (all lists)`);
+            return;
+        }
+        
+        // we shoould be left with only
+        displayMsg(`Recieved MSC command: \n GO cue ${data_array[0]} (cuelist ${data_array[1]})`);
+        fireCueByNumber(data_array[0],data_array[1]);
+        
+    };
+    
+    // utility function (fires cues by their new generated MSC number)
+    function fireCueByNumber(number, cuelist_id) {
+        console.log(number + " - " + cuelist_id)
+        // get all cuelists by data attribute (returns object)
+        let cues = document.querySelectorAll(`[data-msc-cue-number="${number}"]`);
+        // variable to keep track of cuelist from which cues have been fired
+        let clicked;
+        // iterate over cues in object
+        for (const [,element] of Object.entries(cues)) {
+            // get the id of the cuelist that contains the cue we happen to have selected
+            let vccuelist_id = element.offsetParent.offsetParent.id;
+            
+            // the case were a cuelist id is specified
+            if (cuelist_id == vccuelist_id) {
+                element.click();
+                return;
+            } 
+            // the case were no cuelist id was specified
+            else if (cuelist_id == undefined) {
+                // don't fire this cue if the previous one fired was from the same list 
+                // (this handles multiple cues with the same cue number - thus fires only the first one)
+                if (clicked == vccuelist_id) return;
+                // fire the onclick function and keep track of the cuelist id from which the cue originated
+                clicked = vccuelist_id;
+                element.click();
+            }
+        }
+    }
+
+    // utility function (provides a visual way of giving information to the user via the label div)
+    function displayMsg(text, color) {
+        // set the labels contents
+        labeldiv.innerText = text;
+        // set the background colors
+        if (color == "red") labeldiv.style.background = "#d96060" // red/error
+        else if (color == "green") labeldiv.style.background = "#5bdd60" // green/success
+        else labeldiv.style.background = "#f0f4f9" //neutral
+    };
+</script>
